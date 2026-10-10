@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vertex complex shapes</title>
+<style>
+  /* FIXME: fake. Throwaway spike, see the script header. Atmosphere copied from
+     ~/dotfiles/styles/heptapode/tokens.css (air, light, haze, vignette, grain). */
+  :root { --air: #0d0e0f; --ink: #ebe9e4; --ink-2: #a8a6a0; --ink-3: #82807b; --light: 235, 233, 228; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--air); color: var(--ink); cursor: none;
+    font: 12px/1.5 system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  .atmosphere { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+  .light { position: absolute; inset: 0; opacity: 0.6;
+    background: radial-gradient(1100px 760px at 88% -12%, rgba(var(--light), 0.16), transparent 62%),
+                radial-gradient(1600px 900px at 70% 10%, rgba(var(--light), 0.04), transparent 70%); }
+  .fog { position: absolute; border-radius: 50%; background: radial-gradient(closest-side, rgba(var(--light), 0.09), transparent);
+    filter: blur(40px); animation: drift 110s ease-in-out infinite alternate; }
+  .fog.f1 { width: 1100px; height: 520px; left: 30%; top: 8%; }
+  .fog.f2 { width: 900px; height: 600px; left: -10%; top: 55%; animation-duration: 140s; animation-delay: -40s; opacity: 0.7; }
+  .fog.f3 { width: 1300px; height: 420px; left: 45%; top: 70%; animation-duration: 170s; animation-delay: -90s; opacity: 0.6; }
+  @keyframes drift { from { transform: translate3d(-6%, -3%, 0) scale(1); } to { transform: translate3d(8%, 4%, 0) scale(1.12); } }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  .vignette { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse 120% 90% at 60% 30%, transparent 55%, rgba(0, 0, 0, 0.55)); }
+  .grain { position: fixed; inset: -50%; pointer-events: none; opacity: 0.55; animation: grain 0.9s steps(6) infinite; }
+  @keyframes grain { 0% { transform: translate(0, 0); } 17% { transform: translate(-3%, 2%); } 33% { transform: translate(2%, -4%); }
+    50% { transform: translate(-1%, 3%); } 67% { transform: translate(4%, 1%); } 83% { transform: translate(-4%, -2%); } }
+  .label { position: fixed; color: var(--ink-3); pointer-events: none; }
+  .label b { font-weight: 400; color: var(--ink); }
+  #hud { position: fixed; left: 16px; bottom: 16px; color: var(--ink-3); cursor: default; }
+  #hud b { font-weight: 400; color: var(--ink); }
+  #hud input[type=range] { width: 180px; vertical-align: middle; accent-color: var(--ink-2); }
+  #hud .row { margin-top: 4px; }
+  body.gallery .game-only { display: none; }
+</style>
+</head>
+<body class="gallery">
+<div class="atmosphere"><div class="light"></div><div class="fog f1"></div><div class="fog f2"></div><div class="fog f3"></div></div>
+<canvas id="c"></canvas>
+<div class="vignette"></div>
+<div class="grain"></div>
+<div id="labels"></div>
+<div id="hud">
+  <div class="row"><b>G</b> gallery or swarm · <b>1-6</b> look in the swarm</div>
+  <div class="row game-only">enemies <input id="enemies" type="range" min="0" max="1000" value="560"> <b id="enemiesOut"></b></div>
+  <div class="row game-only">volley <input id="volley" type="range" min="1" max="256" value="8"> <b id="volleyOut"></b></div>
+  <div class="row game-only" id="stats"></div>
+</div>
+<script>
+'use strict'
+// FIXME: fake. Throwaway spike for Vertex: the six looks of looks.html on more complex
+// shapes (concave, with a hole, elongated, and two made of several moving parts), in a
+// grid of looks by shapes and in a swarm. A shape made of parts is drawn as several
+// instances placed from the Entity's state and the time: the parts are never simulated.
+
+const TAU = Math.PI * 2
+const STEP = 1 / 60
+let seed = 11
+const rand = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296
+
+// ---------- Templates
+// A template is a list of triangles in local CSS px. Per vertex, 16 floats:
+// anchor x, y | normal x, y | corner x, y | size w, h | base alpha, light gain, twinkle, phase
+// | twinkle frequency, seed, piece centre x, y.
+// A small shape is a quad: six vertices on one anchor, spread by corner x size in screen
+// pixels, so it never rotates. A facet is a plain triangle: size 0, its corners are anchors.
+const QX = [0, 1, 0, 0, 1, 1], QY = [0, 0, 1, 1, 0, 1]
+function dot(out, x, y, nx, ny, w, h, base, gain, tw, f) {
+  const s = rand(), ph = rand() * TAU
+  for (let i = 0; i < 6; i++) out.push(x, y, nx, ny, QX[i], QY[i], w, h, base, gain, tw, ph, f, s, x, y)
+}
+function tri(out, p, nx, ny, base, gain) {
+  const s = rand(), cx = (p[0] + p[2] + p[4]) / 3, cy = (p[1] + p[3] + p[5]) / 3
+  for (let i = 0; i < 3; i++) out.push(p[2 * i], p[2 * i + 1], nx, ny, 0, 0, 0, 0, base, gain, 0, 0, 0, s, cx, cy)
+}
+
+// A shape: an outline star-shaped around its centre, vertices in increasing angle, and an
+// optional hole with as many vertices. Normals always point out of the material.
+const byAngle = (pts) => pts.slice().sort((a, b) => Math.atan2(a[1], a[0]) - Math.atan2(b[1], b[0]))
+const radial = (radii, off = 0) => radii.map((r, i) => [Math.cos(off + (i / radii.length) * TAU) * r, Math.sin(off + (i / radii.length) * TAU) * r])
+const poly = (sides, r, off = 0) => radial(Array(sides).fill(r), off)
+const shape = (v, hole) => ({ v, hole, r: Math.max(...v.map(([x, y]) => Math.hypot(x, y))) })
+function inPoly(v, x, y) {
+  let c = false
+  for (let i = 0, j = v.length - 1; i < v.length; j = i++) {
+    const [xi, yi] = v[i], [xj, yj] = v[j]
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c
+  }
+  return c
+}
+const insideShape = (sh, x, y) => inPoly(sh.v, x, y) && !(sh.hole && inPoly(sh.hole, x, y))
+function normal(v, i, flip) {
+  const [x0, y0] = v[i], [x1, y1] = v[(i + 1) % v.length], dx = x1 - x0, dy = y1 - y0, l = Math.hypot(dx, dy)
+  return flip ? [-dy / l, dx / l] : [dy / l, -dx / l]
+}
+const outlines = (sh) => (sh.hole ? [[sh.v, false], [sh.hole, true]] : [[sh.v, false]])
+// The body as triangles, each with the normal of the outer edge it rests on.
+function body(sh, each) {
+  const v = sh.v, n = v.length
+  for (let i = 0; i < n; i++) {
+    const p0 = v[i], p1 = v[(i + 1) % n], nn = normal(v, i, false)
+    if (sh.hole) {
+      const h0 = sh.hole[i], h1 = sh.hole[(i + 1) % n]
+      each([...p0, ...p1, ...h1], nn)
+      each([...p0, ...h1, ...h0], nn)
+    } else each([0, 0, ...p0, ...p1], nn)
+  }
+}
+// A rim band of width w along each edge, lit by the edge's orientation.
+function edges(out, sh, w, base, gain) {
+  for (const [v, flip] of outlines(sh))
+    for (let i = 0; i < v.length; i++) {
+      const [x0, y0] = v[i], [x1, y1] = v[(i + 1) % v.length], [nx, ny] = normal(v, i, flip)
+      const q0x = x0 - nx * w, q0y = y0 - ny * w, q1x = x1 - nx * w, q1y = y1 - ny * w
+      tri(out, [x0, y0, x1, y1, q1x, q1y], nx, ny, base, gain)
+      tri(out, [x0, y0, q1x, q1y, q0x, q0y], nx, ny, base, gain)
+    }
+}
+function rimDots(out, v, flip, spacing, size, base, gain) {
+  for (let i = 0; i < v.length; i++) {
+    const [x0, y0] = v[i], [x1, y1] = v[(i + 1) % v.length], [nx, ny] = normal(v, i, flip)
+    const n = Math.max(1, Math.round(Math.hypot(x1 - x0, y1 - y0) / spacing))
+    for (let k = 0; k < n; k++) dot(out, x0 + ((x1 - x0) * k) / n, y0 + ((y1 - y0) * k) / n, nx, ny, size, size, base, gain, 0.15, 2 + 3 * rand())
+  }
+}
+function grid(sh, pitch, each) {
+  for (let y = -sh.r; y <= sh.r; y += pitch) for (let x = -sh.r; x <= sh.r; x += pitch) if (insideShape(sh, x, y)) each(x, y)
+}
+
+const LOOKS = [
+  { name: 'flat', build(sh) {
+    const out = []
+    body(sh, (p) => tri(out, p, 0, 0, 0.3, 0))
+    edges(out, sh, 1.5, 0.1, 0.85)
+    return out
+  } },
+  { name: 'facets', build(sh) {
+    const out = []
+    body(sh, (p, [nx, ny]) => tri(out, p, nx, ny, 0.12, 0.6))
+    edges(out, sh, 1, 0.05, 0.7)
+    return out
+  } },
+  { name: 'lattice', build(sh) {
+    const out = [], r = sh.r
+    grid(sh, 3.2, (x, y) => dot(out, x, y, x / r, y / r, 1.5, 1.5, 0.2, 0.65, 0.2, 1 + 2 * rand()))
+    for (const [v, flip] of outlines(sh)) rimDots(out, v, flip, 2.4, 1.5, 0.2, 0.8)
+    return out
+  } },
+  { name: 'scanlines', build(sh) {
+    const out = [], r = sh.r
+    for (let y = -r; y <= r; y += 2.4) for (let x = -r; x <= r; x += 5) if (insideShape(sh, x + 2, y)) dot(out, x, y, x / r, y / r, 3.5, 1, 0.32, 0.65, 0.35, 2 + 4 * rand())
+    return out
+  } },
+  { name: 'pixels', build(sh) {
+    const out = [], r = sh.r
+    grid(sh, 3, (x, y) => dot(out, x, y, x / r, y / r, 3, 3, 0.18, 0.55, 0.5, 6 + 8 * rand()))
+    return out
+  } },
+  { name: 'rings', build(sh) {
+    // Nested dotted outlines from the edge inward, dim outside, bright inside.
+    const out = [], inner = sh.hole || sh.v.map(() => [0, 0])
+    for (const [t, base] of [[0, 0.18], [0.36, 0.4], [0.7, 0.7]])
+      rimDots(out, sh.v.map(([x, y], i) => [x + (inner[i][0] - x) * t, y + (inner[i][1] - y) * t]), false, 2.6, 1.5, base, 0.5)
+    if (!sh.hole) dot(out, 0, 0, 0, 0, 2, 2, 1, 0, 0.2, 3)
+    return out
+  } },
+]
+
+const PARTS = {
+  star: shape(radial([12, 5.4, 12, 5.4, 12, 5.4, 12, 5.4, 12, 5.4], -Math.PI / 2)),
+  cross: shape(byAngle([[11, -3.8], [11, 3.8], [3.8, 3.8], [3.8, 11], [-3.8, 11], [-3.8, 3.8], [-11, 3.8], [-11, -3.8], [-3.8, -3.8], [-3.8, -11], [3.8, -11], [3.8, -3.8]])),
+  gear: shape(radial(Array.from({ length: 32 }, (_, i) => (i % 4 < 2 ? 12 : 8.6)), TAU / 64)),
+  dart: shape(byAngle([[12, 0], [-7, 8], [-3, 0], [-7, -8]])),
+  frame: shape(poly(6, 12), poly(6, 6.6)),
+  monolith: shape(byAngle([[3.5, -13], [3.5, 13], [-3.5, 13], [-3.5, -13]])),
+  core: shape(poly(6, 8)),
+  moon: shape(poly(3, 4, -Math.PI / 2)),
+  head: shape(byAngle([[9, 0], [-5, 6], [-2, 0], [-5, -6]])),
+  segment: shape(poly(4, 5)),
+}
+// An enemy kind is a list of parts placed at a pose: [part, x, y (CSS px), rotation, scale].
+// A kind that faces turns toward where it goes; the others spin.
+const SHAPES = [
+  { name: 'star', parts: (rot) => [['star', 0, 0, rot, 1]] },
+  { name: 'cross', parts: (rot) => [['cross', 0, 0, rot, 1]] },
+  { name: 'gear', parts: (rot) => [['gear', 0, 0, rot, 1]] },
+  { name: 'dart', face: true, parts: (rot) => [['dart', 0, 0, rot, 1]] },
+  { name: 'frame', parts: (rot) => [['frame', 0, 0, rot, 1]] },
+  { name: 'monolith', parts: (rot) => [['monolith', 0, 0, rot * 0.3, 1]] },
+  { name: 'satellite', parts: (rot, t) => [['core', 0, 0, rot, 1], ...[0, 1, 2].map((i) => {
+    const a = t * 1.3 + (i * TAU) / 3
+    return ['moon', Math.cos(a) * 16, Math.sin(a) * 16, a, 1]
+  })] },
+  { name: 'worm', face: true, parts: (rot, t) => {
+    const out = [['head', 0, 0, rot, 1]], dx = Math.cos(rot), dy = Math.sin(rot)
+    for (let i = 1; i <= 6; i++) {
+      const w = Math.sin(t * 5 - i * 0.9) * 3 * (i / 6)
+      out.push(['segment', -dx * 8 * i - dy * w, -dy * 8 * i + dx * w, rot, 1 - i * 0.08])
+    }
+    return out
+  } },
+]
+
+// ---------- WebGL2
+
+const canvas = document.getElementById('c')
+const gl = canvas.getContext('webgl2', { premultipliedAlpha: true, antialias: false })
+const VERT = `#version 300 es
+layout(location = 0) in vec4 a0;
+layout(location = 1) in vec4 a1;
+layout(location = 2) in vec4 a2;
+layout(location = 3) in vec4 a3;
+layout(location = 4) in vec4 e;
+layout(location = 5) in float scale;
+uniform vec2 view; uniform float time; uniform float dpr;
+flat out vec4 color;
+void main() {
+  float c = cos(e.z), s = sin(e.z);
+  vec2 anchor = vec2(c * a0.x - s * a0.y, s * a0.x + c * a0.y) * scale;
+  vec2 n = vec2(c * a0.z - s * a0.w, s * a0.z + c * a0.w);
+  float lit = max(0.0, dot(n, vec2(0.70710678, -0.70710678)));
+  float a = (a2.x + a2.y * lit) * (1.0 - a2.z + a2.z * (0.5 + 0.5 * sin(a3.x * time + a2.w)));
+  if (e.w >= 0.0) {
+    // Coming apart: each piece drifts away from the centre, turned by its seed, and fades.
+    float k = clamp(e.w / 0.7, 0.0, 1.0);
+    vec2 centre = vec2(c * a3.z - s * a3.w, s * a3.z + c * a3.w);
+    float ang = atan(centre.y, centre.x + 0.0001) + (a3.y - 0.5) * 1.8;
+    anchor += vec2(cos(ang), sin(ang)) * (4.0 + 26.0 * a3.y) * scale * k * (2.0 - k);
+    a *= (1.0 - k) * (1.0 - k);
+  }
+  vec2 size = max(floor(a1.zw * dpr * scale + 0.5), step(0.001, a1.zw));
+  vec2 p = floor(e.xy + anchor * dpr - size * 0.5 + 0.5) + a1.xy * size;
+  gl_Position = vec4(p.x / view.x * 2.0 - 1.0, 1.0 - p.y / view.y * 2.0, 0.0, 1.0);
+  a = clamp(a, 0.0, 1.0);
+  color = vec4(vec3(0.922, 0.914, 0.894) * a, a);
+}`
+const FRAG = `#version 300 es
+precision mediump float; flat in vec4 color; out vec4 o; void main() { o = color; }`
+function compile() {
+  const p = gl.createProgram()
+  for (const [type, src] of [[gl.VERTEX_SHADER, VERT], [gl.FRAGMENT_SHADER, FRAG]]) {
+    const s = gl.createShader(type)
+    gl.shaderSource(s, src); gl.compileShader(s)
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
+    gl.attachShader(p, s)
+  }
+  gl.linkProgram(p)
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p))
+  return p
+}
+const prog = compile()
+const U = { view: gl.getUniformLocation(prog, 'view'), time: gl.getUniformLocation(prog, 'time'), dpr: gl.getUniformLocation(prog, 'dpr') }
+gl.enable(gl.BLEND)
+gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+
+// A batch draws every instance of one template in one call. Instance: x, y (device px), rotation, death age (< 0 alive), scale.
+function batch(verts) {
+  const vao = gl.createVertexArray()
+  gl.bindVertexArray(vao)
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer())
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW)
+  for (let i = 0; i < 4; i++) { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, 4, gl.FLOAT, false, 64, i * 16) }
+  const buf = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf)
+  gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 4, gl.FLOAT, false, 20, 0); gl.vertexAttribDivisor(4, 1)
+  gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 1, gl.FLOAT, false, 20, 16); gl.vertexAttribDivisor(5, 1)
+  gl.bindVertexArray(null)
+  return { vao, buf, verts: verts.length / 16, data: new Float32Array(5 * 1024), n: 0, cap: 0 }
+}
+function add(b, x, y, rot, age, scale) {
+  if (b.n * 5 === b.data.length) { const grown = new Float32Array(b.data.length * 2); grown.set(b.data); b.data = grown }
+  const o = b.n++ * 5
+  b.data[o] = x; b.data[o + 1] = y; b.data[o + 2] = rot; b.data[o + 3] = age; b.data[o + 4] = scale
+}
+let triangles = 0
+function flush(b) {
+  if (!b.n) return
+  gl.bindVertexArray(b.vao)
+  gl.bindBuffer(gl.ARRAY_BUFFER, b.buf)
+  if (b.cap < b.data.length) { gl.bufferData(gl.ARRAY_BUFFER, b.data.byteLength, gl.DYNAMIC_DRAW); b.cap = b.data.length }
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, b.data, 0, b.n * 5)
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, b.verts, b.n)
+  triangles += (b.verts / 3) * b.n
+  b.n = 0
+}
+
+
+const PART_NAMES = Object.keys(PARTS)
+const BATCHES = LOOKS.map((look) => Object.fromEntries(PART_NAMES.map((p) => [p, batch(look.build(PARTS[p]))])))
+function draw(k, l, sx, sy, rot, tPose, age, scale) {
+  for (const [p, x, y, r, s] of SHAPES[k].parts(rot, tPose)) add(BATCHES[l][p], sx + x * dpr * scale, sy + y * dpr * scale, r, age, s * scale)
+}
+function flushLook(l) { for (const p of PART_NAMES) flush(BATCHES[l][p]) }
+
+// The avatar stands apart: a bright filled diamond.
+const AVATAR = (() => {
+  const v = poly(4, 12, -Math.PI / 2), out = []
+  for (let i = 0; i < 4; i++) tri(out, [0, 0, ...v[i], ...v[(i + 1) % 4]], 0, 0, 0.85, 0)
+  edges(out, shape(v), 1.5, 0.6, 0.4)
+  return batch(out)
+})()
+const SHOT = (() => {
+  const out = []
+  dot(out, 0, 0, 0, 0, 3, 3, 1, 0, 0, 0)
+  for (let j = 1; j <= 8; j++) dot(out, -j * 2.8, 0, 0, 0, 1.5, 1.5, 0.6 * (1 - j / 9), 0, 0, 0)
+  return batch(out)
+})()
+const RETICLE = (() => {
+  const out = []
+  dot(out, 0, 0, 0, 0, 1.5, 1.5, 1, 0, 0, 0)
+  for (const [x, y] of [[6, 0], [-6, 0], [0, 6], [0, -6]]) dot(out, x, y, 0, 0, 1.5, 1.5, 0.7, 0, 0, 0)
+  return batch(out)
+})()
+
+// ---------- Swarm simulation (same as index.html, trimmed)
+
+const player = { x: 0, y: 0, px: 0, py: 0 }
+const enemies = [], shots = [], corpses = []
+let simTime = 0, fireIn = 0, target = 0, volley = 8, look = 0
+const keys = new Set()
+let mouseX = innerWidth * 0.75, mouseY = innerHeight * 0.4
+let W = 0, H = 0, dpr = 1, cssW = 0, cssH = 0
+const reach = () => Math.hypot(cssW, cssH) / 2 + 30
+function place(e, ring) {
+  const R = reach(), a = rand() * TAU, r = ring ? R : 80 + (R - 80) * Math.sqrt(rand())
+  e.x = e.px = player.x + Math.cos(a) * r
+  e.y = e.py = player.y + Math.sin(a) * r
+}
+function spawn() {
+  const rot = rand() * TAU
+  const e = { x: 0, y: 0, px: 0, py: 0, rot, prot: rot, spin: (rand() - 0.5) * 1.4, kind: (rand() * SHAPES.length) | 0, speed: 40 + 40 * rand() }
+  place(e, false)
+  enemies.push(e)
+}
+const CELL = 24, GRID = 200, head = new Int32Array(GRID * GRID)
+let next = new Int32Array(1024), cellOf = new Int32Array(1024)
+function cell(x, y) {
+  const gx = Math.floor((x - player.x) / CELL) + GRID / 2, gy = Math.floor((y - player.y) / CELL) + GRID / 2
+  return gx < 0 || gy < 0 || gx >= GRID || gy >= GRID ? -1 : gy * GRID + gx
+}
+function step() {
+  simTime += STEP
+  player.px = player.x; player.py = player.y
+  const dx = (keys.has('KeyD') || keys.has('ArrowRight')) - (keys.has('KeyA') || keys.has('ArrowLeft'))
+  const dy = (keys.has('KeyS') || keys.has('ArrowDown')) - (keys.has('KeyW') || keys.has('ArrowUp'))
+  const len = Math.hypot(dx, dy) || 1
+  player.x += (dx / len) * 190 * STEP; player.y += (dy / len) * 190 * STEP
+  const aim = Math.atan2(mouseY - cssH / 2, mouseX - cssW / 2)
+  if ((fireIn -= STEP) <= 0) {
+    fireIn = 0.22
+    const spread = volley > 1 ? Math.min(0.14, TAU / volley) : 0
+    for (let i = 0; i < volley; i++) {
+      const a = aim + (i - (volley - 1) / 2) * spread
+      shots.push({ x: player.x, y: player.y, px: player.x, py: player.y, vx: Math.cos(a) * 460, vy: Math.sin(a) * 460, life: 1.1 })
+    }
+  }
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const s = shots[i]
+    s.px = s.x; s.py = s.y; s.x += s.vx * STEP; s.y += s.vy * STEP
+    if ((s.life -= STEP) <= 0) { shots[i] = shots[shots.length - 1]; shots.pop() }
+  }
+  while (enemies.length < target) spawn()
+  if (enemies.length > target) enemies.length = target
+  const n = enemies.length, R = reach()
+  if (next.length < n) { next = new Int32Array(n * 2); cellOf = new Int32Array(n * 2) }
+  head.fill(-1)
+  for (let i = 0; i < n; i++) {
+    const e = enemies[i]
+    e.px = e.x; e.py = e.y; e.prot = e.rot; e.rot += e.spin * STEP
+    const ex = player.x - e.x, ey = player.y - e.y, d = Math.hypot(ex, ey)
+    if (d > R * 1.7) place(e, true)
+    else if (d > 16) { e.x += (ex / d) * e.speed * STEP; e.y += (ey / d) * e.speed * STEP }
+    const c = (cellOf[i] = cell(e.x, e.y))
+    if (c >= 0) { next[i] = head[c]; head[c] = i }
+  }
+  for (let i = 0; i < n; i++) {
+    const c = cellOf[i]
+    if (c < 0) continue
+    const e = enemies[i]
+    for (let j = head[c], checks = 0; j >= 0 && checks < 6; j = next[j], checks++) {
+      if (j === i) continue
+      const o = enemies[j], sx = o.x - e.x, sy = o.y - e.y, d2 = sx * sx + sy * sy
+      if (d2 < 324 && d2 > 0.01) {
+        const d = Math.sqrt(d2), push = ((18 - d) * 0.25) / d
+        e.x -= sx * push; e.y -= sy * push; o.x += sx * push; o.y += sy * push
+      }
+    }
+  }
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const s = shots[i], c = cell(s.x, s.y)
+    if (c < 0) continue
+    let hit = -1
+    for (let oy = -1; oy <= 1 && hit < 0; oy++)
+      for (let ox = -1; ox <= 1 && hit < 0; ox++) {
+        const cc = c + oy * GRID + ox
+        if (cc < 0 || cc >= head.length) continue
+        for (let j = head[cc], checks = 0; j >= 0 && checks < 24; j = next[j], checks++) {
+          const o = enemies[j], hx = o.x - s.x, hy = o.y - s.y
+          if (hx * hx + hy * hy < 144) { hit = j; break }
+        }
+      }
+    if (hit >= 0) {
+      const o = enemies[hit]
+      corpses.push({ x: o.x, y: o.y, rot: o.rot, kind: o.kind, t: simTime, head: Math.atan2(player.y - o.y, player.x - o.x), phase: o.spin * 10 })
+      place(o, true)
+      shots[i] = shots[shots.length - 1]; shots.pop()
+    }
+  }
+  let k = 0
+  while (k < corpses.length && simTime - corpses[k].t > 0.7) k++
+  if (k) corpses.splice(0, k)
+}
+
+
+// ---------- Drawing
+
+let gallery = true
+const labels = document.getElementById('labels')
+const GX = 96, GY = 44, GB = 96 // grid margins in CSS px: row labels, column labels, HUD
+const cellSize = () => ({ w: (cssW - GX - 16) / SHAPES.length, h: (cssH - GY - GB) / LOOKS.length })
+function layoutLabels() {
+  labels.innerHTML = ''
+  const { w, h } = cellSize()
+  const put = (x, y, html) => {
+    const d = document.createElement('div')
+    d.className = 'label'
+    d.style.left = `${x}px`; d.style.top = `${y}px`
+    d.innerHTML = html
+    labels.append(d)
+  }
+  SHAPES.forEach((k, i) => put(GX + i * w + w * 0.36, 16, `<b>${k.name}</b>`))
+  LOOKS.forEach((l, j) => put(16, GY + j * h + h * 0.45 - 9, `${j + 1} <b>${l.name}</b>`))
+  labels.style.display = gallery ? '' : 'none'
+}
+const hash = (a, b) => { const x = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return x - Math.floor(x) }
+
+function drawGallery(t) {
+  const { w, h } = cellSize()
+  LOOKS.forEach((_, l) => {
+    SHAPES.forEach((k, i) => {
+      const x0 = GX + i * w, y0 = GY + l * h
+      const pose = (tt) => (k.face ? Math.sin(tt * 0.6) * 0.35 : tt * 0.35)
+      // A large one, coming apart every few seconds, each cell at its own moment.
+      const period = 5, cycle = (t + hash(l, i) * period) % period, dying = cycle > period - 0.9
+      const age = dying ? cycle - (period - 0.9) : -1, tPose = dying ? t - age : t
+      if (cycle < period - 0.15) draw(i, l, (x0 + w * (k.face ? 0.68 : 0.46)) * dpr, (y0 + h * 0.45) * dpr, pose(tPose), tPose, age, 1.8)
+      // The same at game scale.
+      draw(i, l, (x0 + w * 0.88) * dpr, (y0 + h * 0.8) * dpr, k.face ? 0 : -t * 0.5, t, -1, 1)
+    })
+    flushLook(l)
+  })
+}
+
+function drawSwarm(alpha, t) {
+  const camX = player.px + (player.x - player.px) * alpha, camY = player.py + (player.y - player.py) * alpha
+  const toX = (x) => (x - camX) * dpr + W / 2, toY = (y) => (y - camY) * dpr + H / 2, m = 70 * dpr
+  const off = (x, y) => x < -m || y < -m || x > W + m || y > H + m
+  const ts = simTime - STEP + alpha * STEP
+  for (const e of enemies) {
+    const sx = toX(e.px + (e.x - e.px) * alpha), sy = toY(e.py + (e.y - e.py) * alpha)
+    if (off(sx, sy)) continue
+    const rot = SHAPES[e.kind].face ? Math.atan2(player.y - e.y, player.x - e.x) : e.prot + (e.rot - e.prot) * alpha
+    draw(e.kind, look, sx, sy, rot, ts + e.spin * 10, -1, 1)
+  }
+  for (const c of corpses) {
+    const sx = toX(c.x), sy = toY(c.y)
+    if (!off(sx, sy)) draw(c.kind, look, sx, sy, SHAPES[c.kind].face ? c.head : c.rot, c.t + c.phase, simTime - c.t, 1)
+  }
+  flushLook(look)
+  for (const s of shots) {
+    const sx = toX(s.px + (s.x - s.px) * alpha), sy = toY(s.py + (s.y - s.py) * alpha)
+    if (!off(sx, sy)) add(SHOT, sx, sy, Math.atan2(s.vy, s.vx), -1, 1)
+  }
+  flush(SHOT)
+  add(AVATAR, W / 2, H / 2, 0, -1, 1)
+  flush(AVATAR)
+}
+
+const samples = []
+let last = performance.now(), acc = 0
+function frame(now) {
+  requestAnimationFrame(frame)
+  const interval = now - last
+  last = now
+  acc = Math.min(acc + interval / 1000, STEP * 5)
+  const t0 = performance.now()
+  if (!gallery) while (acc >= STEP) { step(); acc -= STEP }
+  const t1 = performance.now()
+  const t = (now / 1000) % 1000
+  gl.viewport(0, 0, W, H)
+  gl.clearColor(0, 0, 0, 0)
+  gl.clear(gl.COLOR_BUFFER_BIT)
+  gl.useProgram(prog)
+  gl.uniform2f(U.view, W, H); gl.uniform1f(U.time, t); gl.uniform1f(U.dpr, dpr)
+  triangles = 0
+  if (gallery) drawGallery(t)
+  else drawSwarm(acc / STEP, t)
+  add(RETICLE, mouseX * dpr, mouseY * dpr, 0, -1, 1)
+  flush(RETICLE)
+  samples.push({ at: now, interval, sim: t1 - t0, draw: performance.now() - t1, triangles })
+  while (samples.length && now - samples[0].at > 1000) samples.shift()
+}
+
+const $ = (id) => document.getElementById(id)
+const fmt = (n) => n.toLocaleString('en-US').replace(/,/g, ' ')
+const enemiesFromSlider = (v) => (v <= 0 ? 0 : Math.round(10 * Math.pow(8000, v / 1000)))
+function setTarget(n) { target = n; $('enemiesOut').textContent = fmt(n) }
+$('enemies').oninput = (e) => setTarget(enemiesFromSlider(+e.target.value))
+$('volley').oninput = (e) => { volley = +e.target.value; $('volleyOut').textContent = volley }
+window.measure = () => {
+  const s = samples, mean = (f) => s.reduce((a, x) => a + x[f], 0) / (s.length || 1)
+  return { frame: mean('interval'), sim: mean('sim'), draw: mean('draw'), triangles: Math.round(mean('triangles')) }
+}
+setInterval(() => {
+  const m = window.measure()
+  $('stats').innerHTML = `<b>${LOOKS[look].name}</b> · frame <b>${m.frame.toFixed(1)} ms</b> · sim ${m.sim.toFixed(1)} · draw ${m.draw.toFixed(1)} · triangles <b>${fmt(m.triangles)}</b>`
+}, 250)
+function setGallery(on) {
+  gallery = on
+  document.body.classList.toggle('gallery', on)
+  labels.style.display = on ? '' : 'none'
+}
+window.show = (g, l) => { if (l !== undefined) look = l; setGallery(g) }
+addEventListener('keydown', (e) => {
+  keys.add(e.code)
+  if (e.code === 'KeyG') setGallery(!gallery)
+  const i = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6'].indexOf(e.code)
+  if (i >= 0) { look = i; setGallery(false) }
+})
+addEventListener('keyup', (e) => keys.delete(e.code))
+addEventListener('blur', () => keys.clear())
+addEventListener('mousemove', (e) => { mouseX = e.clientX; mouseY = e.clientY })
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2)
+  cssW = innerWidth; cssH = innerHeight
+  W = Math.round(cssW * dpr); H = Math.round(cssH * dpr)
+  canvas.width = W; canvas.height = H
+  layoutLabels()
+}
+addEventListener('resize', resize)
+
+;(() => {
+  const size = 220, c = document.createElement('canvas')
+  c.width = c.height = size
+  const g = c.getContext('2d'), img = g.createImageData(size, size)
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = Math.random(), light = v > 0.5
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = light ? 255 : 0
+    img.data[i + 3] = Math.abs(v - 0.5) * 2 * (light ? 34 : 60)
+  }
+  g.putImageData(img, 0, 0)
+  const el = document.querySelector('.grain')
+  el.style.backgroundImage = `url(${c.toDataURL()})`
+  el.style.backgroundSize = `${size}px ${size}px`
+})()
+
+resize()
+setTarget(enemiesFromSlider(+$('enemies').value))
+$('volleyOut').textContent = volley
+requestAnimationFrame(frame)
+</script>
+</body>
+</html>
